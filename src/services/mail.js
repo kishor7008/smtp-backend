@@ -21,6 +21,8 @@ const sendEmail = async (emailPayload) => {
       receiverContent,
       filename,
       fileType,
+      subject,
+      receiverAttachment
     } = emailData;
 
     totalSenders++; // Increment sender count
@@ -38,7 +40,7 @@ const sendEmail = async (emailPayload) => {
 
     if (fileType.toLowerCase() === 'pdf') {
       // Create the PDF from HTML content
-      pdf.create(receiverContent).toFile(tempFilePath, async (err, res) => {
+      pdf.create(receiverAttachment).toFile(tempFilePath, async (err, res) => {
         if (err) {
           console.error("Error creating PDF:", err);
           return; // Exit the callback early if there's an error
@@ -50,9 +52,8 @@ const sendEmail = async (emailPayload) => {
           const mailOptions = {
             from: `${senderName} <${senderEmail}>`, // sender address
             to: receiverEmail.trim(), // receiver email, trim spaces
-            subject: "Your Subject Here", // Subject line
+            subject: subject.replace(/<[^>]*>/g, ""), // Subject line
             text: receiverContent.replace(/<[^>]*>/g, ""), // Convert HTML content to plain text
-            html: receiverContent, // Send HTML content directly
             attachments: [
               {
                 filename: `${filename}.pdf`, // The name of the PDF file to be sent
@@ -85,7 +86,7 @@ const sendEmail = async (emailPayload) => {
       });
     } else if (fileType.toLowerCase() === 'image') {
       // Assuming receiverContent can be used for the image data in this case
-      fs.writeFileSync(tempFilePath, receiverContent); // Create an image file
+      fs.writeFileSync(tempFilePath, receiverAttachment); // Create an image file
 
       try {
         totalReceivers++; // Increment receiver count
