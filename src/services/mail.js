@@ -11,19 +11,23 @@ const sendEmail = async (emailPayload) => {
 
   const startTime = Date.now(); // Start time for tracking response time
 
-  // Loop over each email data in the payload
   for (const emailData of emailPayload) {
     const {
       senderEmail,
       senderPassword,
       receiverEmail,
       senderName,
-      receiverContent,
-      filename,
-      fileType,
-      subject,
-      receiverAttachment
+      receiverContent = "",
+      filename = "",
+      fileType = "",
+      subject = "No Subject",
+      receiverAttachment = null,
     } = emailData;
+
+    if (!senderEmail || !receiverEmail) {
+      console.error("Sender or receiver email is missing.");
+      continue;
+    }
 
     totalSenders++; // Increment sender count
 
@@ -35,106 +39,65 @@ const sendEmail = async (emailPayload) => {
       },
     });
 
-    // Define the path for the temporary file based on fileType
-    const tempFilePath = path.join(__dirname, `${filename}.${fileType.toLowerCase()}`);
+    let tempFilePath ;
+    if(receiverAttachment){
+      tempFilePath=  path.join(__dirname, `${filename}.${fileType.toLowerCase()}`);
+    } 
+    let attachments = [];
 
-    if (fileType.toLowerCase() === 'pdf') {
-      // Create the PDF from HTML content
-      pdf.create(receiverAttachment).toFile(tempFilePath, async (err, res) => {
-        if (err) {
-          console.error("Error creating PDF:", err);
-          return; // Exit the callback early if there's an error
-        }
+    try {
+      if (receiverAttachment && fileType.toLowerCase() === "pdf") {
+        // Create the PDF if the attachment exists
+        await new Promise((resolve, reject) => {
+          pdf.create(receiverAttachment).toFile(tempFilePath, (err, res) => {
+            if (err) return reject(err);
+            resolve(res);
+          });
+        });
 
-        try {
-          totalReceivers++; // Increment receiver count
+        attachments.push({
+          filename: `${filename}.pdf`,
+          path: tempFilePath,
+          contentType: "application/pdf",
+        });
+      } else if (receiverAttachment && fileType.toLowerCase() === "image") {
+        // Write the image data if it exists
+        fs.writeFileSync(tempFilePath, receiverAttachment);
 
-          const mailOptions = {
-            from: `${senderName} <${senderEmail}>`, // sender address
-            to: receiverEmail.trim(), // receiver email, trim spaces
-            subject: subject.replace(/<[^>]*>/g, ""), // Subject line
-            text: receiverContent.replace(/<[^>]*>/g, ""), // Convert HTML content to plain text
-            attachments: [
-              {
-                filename: `${filename}.pdf`, // The name of the PDF file to be sent
-                path: tempFilePath, // Path to the temporary PDF file
-                contentType: "application/pdf", // Content type for PDF
-              },
-            ],
-          };
-
-          const info = await transporter.sendMail(mailOptions);
-          console.log(`Message sent from ${senderEmail} to ${receiverEmail}: %s`, info.messageId);
-        } catch (error) {
-          console.error(`Error sending email from ${senderEmail} to ${receiverEmail}:`, error.message);
-
-          // Track sender and receiver failures
-          if (!senderFailures.includes(senderEmail)) {
-            senderFailures.push(senderEmail);
-          }
-          if (!receiverFailures.includes(receiverEmail)) {
-            receiverFailures.push(receiverEmail);
-          }
-        } finally {
-          // Clean up: remove the temporary file after sending the email
-          if (fs.existsSync(tempFilePath)) {
-            fs.unlinkSync(tempFilePath);
-          } else {
-            console.log(`File does not exist, cannot unlink: ${tempFilePath}`);
-          }
-        }
-      });
-    } else if (fileType.toLowerCase() === 'image') {
-      // Assuming receiverContent can be used for the image data in this case
-      fs.writeFileSync(tempFilePath, receiverAttachment); // Create an image file
-
-      try {
-        totalReceivers++; // Increment receiver count
-
-        const mailOptions = {
-          from: `${senderName} <${senderEmail}>`, // sender address
-          to: receiverEmail.trim(), // receiver email, trim spaces
-          subject: "Your Subject Here", // Subject line
-          text: receiverContent.replace(/<[^>]*>/g, ""), // Convert HTML content to plain text
-          html: receiverContent, // Send HTML content directly
-          attachments: [
-            {
-              filename: `${filename}.png`, // The name of the image file to be sent
-              path: tempFilePath, // Path to the temporary image file
-              contentType: "image/png", // Content type for PNG
-            },
-          ],
-        };
-
-        const info = await transporter.sendMail(mailOptions);
-        console.log(`Message sent from ${senderEmail} to ${receiverEmail}: %s`, info.messageId);
-      } catch (error) {
-        console.error(`Error sending email from ${senderEmail} to ${receiverEmail}:`, error.message);
-
-        // Track sender and receiver failures
-        if (!senderFailures.includes(senderEmail)) {
-          senderFailures.push(senderEmail);
-        }
-        if (!receiverFailures.includes(receiverEmail)) {
-          receiverFailures.push(receiverEmail);
-        }
-      } finally {
-        // Clean up: remove the temporary file after sending the email
-        if (fs.existsSync(tempFilePath)) {
-          fs.unlinkSync(tempFilePath);
-        } else {
-          console.log(`File does not exist, cannot unlink: ${tempFilePath}`);
-        }
+        attachments.push({
+          filename: `${filename}.png`,
+          path: tempFilePath,
+          contentType: "image/png",
+        });
       }
-    } else {
-      console.error(`Unsupported file type: ${fileType}`);
+
+      const mailOptions = {
+        from: `${senderName || "No Name"} <${senderEmail}>`,
+        to: receiverEmail.trim(),
+        subject: (subject || "").replace(/<[^>]*>/g, ""),
+        text: (receiverContent || "").replace(/<[^>]*>/g, ""),
+        attachments: attachments.length ? attachments : undefined, // Only add attachments if they exist
+      };
+
+      totalReceivers++; // Increment receiver count
+      const info = await transporter.sendMail(mailOptions);
+      console.log(`Message sent from ${senderEmail} to ${receiverEmail}: %s`, info.messageId);
+    } catch (error) {
+      console.error(`Error sending email from ${senderEmail} to ${receiverEmail}:`, error.message);
+
+      if (!senderFailures.includes(senderEmail)) senderFailures.push(senderEmail);
+      if (!receiverFailures.includes(receiverEmail)) receiverFailures.push(receiverEmail);
+    } finally {
+      // Clean up: Remove the file only if it was created
+      if (fs?.existsSync(tempFilePath) && tempFilePath) {
+        fs?.unlinkSync(tempFilePath);
+      }
     }
   }
 
-  const endTime = Date.now(); // End time for tracking response time
-  const responseTime = (endTime - startTime) / 1000; // Calculate response time in seconds
+  const endTime = Date.now();
+  const responseTime = (endTime - startTime) / 1000;
 
-  // Return the failure records and additional information
   return {
     totalSenders,
     senderFailures: senderFailures.length,
