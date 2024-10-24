@@ -2,6 +2,7 @@ const express = require("express");
 const { sendEmail } = require("./src/services/mail");
 const multer = require("multer");
 const cors = require("cors");
+require('dotenv').config(); 
 const app = express();
 
 app.use(express.json());
