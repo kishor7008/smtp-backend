@@ -7,7 +7,7 @@ const AWS = require('aws-sdk');
 const os = require('os');
 const app = express();
 AWS.config.update({ region: 'ap-south-1' });
-
+console.log("wesd")
 const ec2 = new AWS.EC2();
 
 app.use(express.json());
