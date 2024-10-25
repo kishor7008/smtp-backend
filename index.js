@@ -41,25 +41,29 @@ app.post('/ec2/refresh-ips/:count', async (req, res) => {
 
   try {
     // Step 1: Retrieve existing Elastic IPs
-    const describeCommand = new DescribeAddressesCommand({});
-    const describeResult = await ec2.send(describeCommand);
-    
-    const existingIps = describeResult.Addresses;
-    
-    // Step 2: Release existing Elastic IPs 
-    if (existingIps.length > 0) {
-      const releasePromises = existingIps.map(ip => {
+    const describeAddressesCommand = new DescribeAddressesCommand({});
+    const addressResult = await ec2.send(describeAddressesCommand);
+    const existingIps = addressResult.Addresses;
+
+    // Step 2: Check if IPs are disassociated (i.e., not in use) and release them
+    const releasePromises = existingIps
+      .filter(ip => !ip.InstanceId) // Only release IPs not associated with any instance
+      .map(ip => {
         const releaseCommand = new ReleaseAddressCommand({ AllocationId: ip.AllocationId });
         return ec2.send(releaseCommand);
       });
+
+    if (releasePromises.length > 0) {
       await Promise.all(releasePromises); // Wait for all releases to complete
-      console.log(`Released existing IPs: ${existingIps.map(ip => ip.PublicIp)}`);
+      console.log(`Released IPs: ${existingIps.filter(ip => !ip.InstanceId).map(ip => ip.PublicIp)}`);
+    } else {
+      console.log('No unassociated IPs to release.');
     }
 
     // Step 3: Allocate new Elastic IPs
     const newIps = [];
     for (let i = 0; i < ipCount; i++) {
-      const allocateCommand = new AllocateAddressCommand({});
+      const allocateCommand = new AllocateAddressCommand({ Domain: 'vpc' });
       const result = await ec2.send(allocateCommand);
       newIps.push(result.PublicIp); // Store newly allocated IPs
     }
@@ -75,7 +79,24 @@ app.post('/ec2/refresh-ip/:instanceId', async (req, res) => {
   const instanceId = req.params.instanceId;
 
   try {
-    // Allocate a new Elastic IP
+    // Describe the instance to check for an existing Elastic IP
+    const describeParams = { InstanceIds: [instanceId] };
+    const describeCommand = new DescribeInstancesCommand(describeParams);
+    const instanceData = await ec2.send(describeCommand);
+
+    const networkInterface = instanceData.Reservations[0].Instances[0].NetworkInterfaces[0];
+    const association = networkInterface.Association;
+
+    if (association && association.AllocationId) {
+      // If an Elastic IP is already associated, return it
+      res.json({
+        message: 'Elastic IP already associated',
+        publicIp: association.PublicIp,
+      });
+      return;
+    }
+
+    // Allocate a new Elastic IP if not already present
     const allocateCommand = new AllocateAddressCommand({ Domain: 'vpc' });
     const allocation = await ec2.send(allocateCommand);
 
