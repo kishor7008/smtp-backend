@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/client-ec2": "^3.679.0",
+    "@aws-sdk/client-route-53": "^3.679.0",
     "aws-sdk": "^2.1691.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
