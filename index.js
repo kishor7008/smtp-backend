@@ -9,10 +9,6 @@ const {
   AllocateAddressCommand, 
   AssociateAddressCommand 
 } = require('@aws-sdk/client-ec2');
-const { 
-  Route53Client, 
-  ChangeResourceRecordSetsCommand 
-} = require('@aws-sdk/client-route-53');
 const { sendEmail } = require('./src/services/mail');
 
 const app = express();
@@ -20,7 +16,7 @@ const PORT = 3000;
 app.use(express.json());
 const upload = multer(); // For handling multipart form-data
 
-// AWS EC2 and Route 53 clients
+// AWS EC2 client
 const ec2 = new EC2Client({
   region: process.env.AWS_REGION,
   credentials: {
@@ -28,10 +24,6 @@ const ec2 = new EC2Client({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '<your-secret-access-key>',
   },
 });
-const route53 = new Route53Client({ region: process.env.AWS_REGION });
-
-const HOSTED_ZONE_ID = 'Z01693807FDPMRPZ0P9D'; // Replace with your hosted zone ID
-const DOMAIN_NAME = 'amayra.amayra.com'; // Replace with your domain name
 
 // Route: Fetch running EC2 instance IPs
 app.get('/ec2/ips', async (req, res) => {
@@ -45,9 +37,20 @@ app.get('/ec2/ips', async (req, res) => {
 
     const ips = runningInstances.map(instance => ({
       instanceId: instance.InstanceId,
-      publicIp: instance.PublicIpAddress || 'N/A',
-      privateIp: instance.PrivateIpAddress,
+      publicIps: instance.NetworkInterfaces.flatMap(ni =>
+        ni.Association?.PublicIp ? [ni.Association.PublicIp] : []
+      ),
+      privateIps: instance.NetworkInterfaces.flatMap(ni =>
+        ni.PrivateIpAddresses.map(ipInfo => ipInfo.PrivateIpAddress)
+      ),
+      // Collecting all public IPs from possible multiple IP associations
+      allPublicIps: instance.NetworkInterfaces.flatMap(ni =>
+        ni.PrivateIpAddresses
+          .filter(ipInfo => ipInfo.Association?.PublicIp)
+          .map(ipInfo => ipInfo.Association.PublicIp)
+      ),
     }));
+
     res.json(ips);
   } catch (error) {
     console.error('Error fetching EC2 IPs:', error);
@@ -55,125 +58,118 @@ app.get('/ec2/ips', async (req, res) => {
   }
 });
 
-// Route: Refresh multiple Elastic IPs and update Route 53 DNS
+
+
+// Route: Refresh IPs based on conditions and create new IPs
 app.post('/ec2/refresh-ips/:count', async (req, res) => {
   const ipCount = parseInt(req.params.count);
 
   try {
-    // Step 1: Retrieve existing Elastic IPs
+    // Step 1: Get running instances
+    const instancesCommand = new DescribeInstancesCommand({});
+    const instances = await ec2.send(instancesCommand);
+    const runningInstances = instances.Reservations.flatMap(r =>
+      r.Instances.filter(i => i.State.Name === 'running')
+    );
+
+    console.log('Running instances:', runningInstances);  // Log for verification
+
+    // Optional: Relax the condition to proceed with fewer instances
+    if (runningInstances.length === 0) {
+      return res.status(400).json({
+        message: 'No running instances found.',
+      });
+    }
+
+    // Step 2: Retrieve existing Elastic IPs
     const describeAddressesCommand = new DescribeAddressesCommand({});
     const addressResult = await ec2.send(describeAddressesCommand);
     const existingIps = addressResult.Addresses;
 
-    // Step 2: Release unassociated IPs
-    const releasePromises = existingIps
-      .filter(ip => !ip.InstanceId) // Only unassociated IPs
-      .map(ip => {
-        const releaseCommand = new ReleaseAddressCommand({ AllocationId: ip.AllocationId });
-        return ec2.send(releaseCommand);
-      });
+    console.log('Existing IPs:', existingIps);  // Log for verification
 
-    if (releasePromises.length > 0) {
-      await Promise.all(releasePromises);
-      console.log(`Released IPs: ${existingIps.filter(ip => !ip.InstanceId).map(ip => ip.PublicIp)}`);
-    } else {
-      console.log('No unassociated IPs to release.');
-    }
+    // Step 3: Release all existing IPs
+    const releasePromises = existingIps.map(ip => {
+      const releaseCommand = new ReleaseAddressCommand({ AllocationId: ip.AllocationId });
+      return ec2.send(releaseCommand);
+    });
 
-    // Step 3: Allocate new Elastic IPs
+    await Promise.all(releasePromises);
+    console.log('Released all existing Elastic IPs.');
+
+    // Step 4: Allocate new Elastic IPs (distribute IPs across instances)
     const newIps = [];
     const allocationPromises = Array.from({ length: ipCount }, async () => {
       const allocateCommand = new AllocateAddressCommand({ Domain: 'vpc' });
       const result = await ec2.send(allocateCommand);
-      newIps.push(result.PublicIp);
+      newIps.push({ AllocationId: result.AllocationId, PublicIp: result.PublicIp });
       return result;
     });
 
     await Promise.all(allocationPromises);
     console.log('Allocated new Elastic IPs:', newIps);
 
-    // Step 4: Prepare Route 53 DNS update with all IPs in a single record
-    const changeBatch = {
-      Changes: [
-        {
-          Action: 'UPSERT',
-          ResourceRecordSet: {
-            Name: `${DOMAIN_NAME}.`, // Ensure absolute DNS name with trailing dot
-            Type: 'A',
-            TTL: 300,
-            ResourceRecords: newIps.map(ip => ({ Value: ip })), // All IPs under the same record
-          },
-        },
-      ],
-    };
-
-    // Step 5: Execute Route 53 DNS update
-    const route53Command = new ChangeResourceRecordSetsCommand({
-      HostedZoneId: HOSTED_ZONE_ID,
-      ChangeBatch: changeBatch,
+    // Step 5: Associate IPs to instances
+    const instanceAssociations = runningInstances.map(async (instance, index) => {
+      const ip = newIps[index % newIps.length];  // Distribute IPs in a round-robin manner
+      const associateCommand = new AssociateAddressCommand({
+        InstanceId: instance.InstanceId,
+        AllocationId: ip.AllocationId,
+      });
+      await ec2.send(associateCommand);
+      console.log(`Associated IP ${ip.PublicIp} with instance ${instance.InstanceId}`);
     });
 
-    await route53.send(route53Command);
-    console.log('Updated Route 53 DNS records.');
+    await Promise.all(instanceAssociations);
 
-    // Step 6: Return response
+    // Step 6: Return response with allocated and associated IPs
     res.json({
-      message: `Allocated ${ipCount} new Elastic IPs and associated them with Route 53 DNS record.`,
+      message: `Allocated and associated ${ipCount} Elastic IPs.`,
       newIps,
     });
   } catch (error) {
-    console.error('Error refreshing Elastic IPs or updating Route 53:', error);
-    res.status(500).send('Failed to refresh IPs and update Route 53');
+    console.error('Error refreshing Elastic IPs:', error);
+    res.status(500).send('Failed to refresh IPs');
   }
 });
 
 
-// Route: Refresh a single EC2 instance's IP and update Route 53 DNS
 app.post('/ec2/refresh-ip/:instanceId', async (req, res) => {
   const instanceId = req.params.instanceId;
 
   try {
-    // Step 1: Allocate a new Elastic IP
+    // Step 1: Describe the existing Elastic IP associated with the instance
+    const describeCommand = new DescribeAddressesCommand({ Filters: [{ Name: 'instance-id', Values: [instanceId] }] });
+    const { Addresses } = await ec2.send(describeCommand);
+    
+    if (Addresses.length === 0) {
+      return res.status(400).json({ message: 'No Elastic IP found for this instance.' });
+    }
+
+    const oldAllocationId = Addresses[0].AllocationId;
+
+    // Step 2: Release the old Elastic IP
+    const releaseCommand = new ReleaseAddressCommand({ AllocationId: oldAllocationId });
+    await ec2.send(releaseCommand);
+
+    // Step 3: Allocate a new Elastic IP
     const allocateCommand = new AllocateAddressCommand({ Domain: 'vpc' });
     const allocation = await ec2.send(allocateCommand);
 
-    // Step 2: Associate the new IP with the EC2 instance
+    // Step 4: Associate the new IP with the EC2 instance
     const associateCommand = new AssociateAddressCommand({
       InstanceId: instanceId,
       AllocationId: allocation.AllocationId,
     });
     await ec2.send(associateCommand);
 
-    // Step 3: Update Route 53 with the new IP
-    const changeBatch = {
-      Changes: [
-        {
-          Action: 'UPSERT',
-          ResourceRecordSet: {
-            Name: `${DOMAIN_NAME}.`,
-            Type: 'A',
-            TTL: 300,
-            ResourceRecords: [{ Value: allocation.PublicIp }],
-          },
-        },
-      ],
-    };
-
-    const route53Command = new ChangeResourceRecordSetsCommand({
-      HostedZoneId: HOSTED_ZONE_ID,
-      ChangeBatch: changeBatch,
-    });
-
-    await route53.send(route53Command);
-    console.log('Updated Route 53 DNS records.');
-
     res.json({
-      message: 'New IP allocated, associated, and DNS updated',
-      publicIp: allocation.PublicIp,
+      message: 'IP address refreshed and associated with the same EC2 instance',
+      newPublicIp: allocation.PublicIp,
     });
   } catch (error) {
     console.error('Error refreshing IP:', error);
-    res.status(500).send('Failed to refresh IP and update DNS');
+    res.status(500).send('Failed to refresh IP');
   }
 });
 
